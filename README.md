@@ -155,3 +155,13 @@ Record tracking error, Cartesian error, torque, torque rate, solver time, deadli
 ## License
 
 MIT
+
+
+
+## Test
+Create the Python environment
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install casadi numpy
+```
