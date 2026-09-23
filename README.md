@@ -47,12 +47,16 @@ The dry-run package itself uses standard ROS 2 messages and does not require Fra
 ## Clone and build
 
 ```bash
-cd ~/franka_ros2_ws/src
+mkdir -p ~/fr3_nmpc_ws/src
+cd ~/fr3_nmpc_ws/src
 git clone https://github.com/ytang19-glitch/fr3_nmpc_controller.git
 
-cd ~/franka_ros2_ws
+source /opt/ros/jazzy/setup.bash
+source /opt/franka_ros2_ws/install/setup.bash
+
+cd ~/fr3_nmpc_ws
 rosdep install --from-paths src --ignore-src -r -y
-colcon build --packages-select fr3_nmpc_controller --symlink-install
+colcon build --symlink-install
 source install/setup.bash
 ```
 
