@@ -1,167 +1,323 @@
 # FR3 NMPC Controller
 
-Research scaffold for testing reference-trajectory tracking before connecting a nonlinear MPC controller to a real Franka FR3.
+Research project for tracking smooth MoveIt reference trajectories with nonlinear model predictive control on a Franka FR3.
 
-The repository currently provides:
-
-- a ROS 2 C++ reference monitor that consumes `trajectory_msgs/JointTrajectory`;
-- cubic-Hermite sampling of position and velocity references;
-- joint-name, timing, dimension, and finite-value validation;
-- a minimum-jerk reference publisher for conservative bench tests;
-- an offline CasADi NMPC example using a constrained seven-joint double-integrator model;
-- a staged real-robot test plan.
+> [!IMPORTANT]
+> The project is divided into two parts:
+>
+> 1. **Offline controller development:** prove the optimization, reference tracking, constraints, and timing without robot hardware.
+> 2. **Online robot control:** connect the validated controller to live FR3 measurements and eventually command safe joint torque.
 
 > [!WARNING]
-> This version is intentionally **dry-run only**. It does not claim effort interfaces and does not command robot torque. Do not connect experimental NMPC torque output to the FR3 until the model, limits, watchdog, torque-rate limiter, fallback controller, and real-time behavior have been reviewed with the laboratory supervisor.
+> The repository does **not yet contain a hardware-ready FR3 torque NMPC controller**. The ROS 2 tools currently operate in read-only/dry-run mode and never publish effort commands.
 
-## Intended architecture
+## Current status
+
+| Capability | Status |
+|---|---|
+| Generate a smooth minimum-jerk reference | Implemented |
+| Solve a seven-joint constrained MPC problem offline | Implemented |
+| Measure offline tracking error and solution time | Implemented |
+| Receive live `/joint_states` | Implemented |
+| Receive and interpolate a MoveIt `JointTrajectory` | Implemented |
+| Publish sampled reference and tracking error | Implemented |
+| Full nonlinear FR3 rigid-body dynamics | Not implemented |
+| Real-time C++ NMPC solver | Not implemented |
+| Torque/rate safety filter and fallback controller | Not implemented |
+| Command FR3 effort interfaces | Not implemented |
+
+# Part I — Offline controller development
+
+## Why test the controller offline first?
+
+An MPC/NMPC controller contains several independent elements:
+
+- a robot model;
+- a reference trajectory;
+- a prediction horizon;
+- a cost function;
+- constraints;
+- a numerical optimizer;
+- receding-horizon feedback.
+
+Testing these first without hardware separates optimization problems from ROS, network, timing, and robot-safety problems.
+
+Offline testing answers the following questions safely:
+
+1. Does the optimizer converge?
+2. Does the predicted state follow the reference?
+3. Are position, velocity, acceleration, and input constraints respected?
+4. How do horizon length and cost weights change the result?
+5. How long does every optimization take?
+6. What happens when the problem becomes infeasible?
+
+If these questions are unresolved offline, connecting the optimizer to a real FR3 makes diagnosis harder and may produce unsafe commands.
+
+## What the current offline example does
+
+The script is:
 
 ```text
-MoveIt trajectory
-      |
-      v
-Reference monitor / sampler ---- measured joint states
-      |
-      v
-NMPC solver (next stage)
-      |
-      v
-Safety filter + fallback (next stage)
-      |
-      v
-FR3 effort controller (only after staged validation)
+scripts/offline_nmpc_demo.py
 ```
 
-## Platform
+It uses the state
 
-Designed as a starting point for:
+```math
+x = \begin{bmatrix}q & \dot q\end{bmatrix}^{T}
+```
 
-- Ubuntu 24.04
-- ROS 2 Jazzy
-- Franka FR3
-- `franka_ros2` 3.x
-- `libfranka` 0.20.x
+and joint acceleration as its input:
 
-The dry-run package itself uses standard ROS 2 messages and does not require Franka hardware.
+```math
+u = \ddot q.
+```
 
-## Clone and build
+The prediction model is:
+
+```math
+q_{k+1}=q_k+\Delta t\dot q_k+\frac{1}{2}\Delta t^2u_k
+```
+
+```math
+\dot q_{k+1}=\dot q_k+\Delta t u_k.
+```
+
+At every simulation step, the optimizer predicts a sequence of future inputs but applies only the first input. It then receives the new simulated state and solves again.
+
+### Scientific limitation
+
+The current plant model is a **double integrator**, so this example validates the MPC structure and software pipeline. It is not yet the final nonlinear FR3 controller.
+
+The final torque-controlled model must include:
+
+```math
+M(q)\ddot q+C(q,\dot q)\dot q+g(q)=\tau,
+```
+
+with torque input:
+
+```math
+u=\tau.
+```
+
+## Run the offline demonstration
+
+No ROS 2 or Franka hardware is required.
 
 ```bash
+cd ~/fr3_nmpc_ws/src/fr3_nmpc_controller
+
+python3 -m venv .venv
+source .venv/bin/activate
+pip install casadi numpy
+
+python3 scripts/offline_nmpc_demo.py
+```
+
+## Measured result
+
+A test on September 23, 2026 produced:
+
+```text
+Offline NMPC demonstration complete
+Final position-error norm: 0.000031 rad
+Maximum position-error norm: 0.002039 rad
+Mean solve time: 7.634 ms
+Maximum solve time: 13.266 ms
+No robot commands were produced.
+```
+
+Interpretation:
+
+- the simplified simulated system tracked its reference accurately;
+- the optimizer completed successfully throughout this test;
+- the mean time corresponds to roughly 131 solutions per second;
+- the worst observed time corresponds to roughly 75 solutions per second;
+- this Python/IPOPT implementation is therefore **not a 1 kHz controller**;
+- accurate offline tracking does not yet prove stability or safety on the real FR3.
+
+## Next offline experiments
+
+Keep the same reference and compare:
+
+| Experiment | Change | Question |
+|---|---|---|
+| Horizon study | 10, 20, 30 steps | How do preview and solution time change? |
+| Speed study | Reduce trajectory duration | When does tracking error increase? |
+| Weight study | Change tracking and input weights | How does aggressiveness change? |
+| Constraint study | Tighten velocity/acceleration bounds | When does the problem become infeasible? |
+| Disturbance study | Add state disturbance/model error | Does feedback recover? |
+
+The next major implementation step is replacing the double-integrator model with verified FR3 rigid-body dynamics and testing it in simulation.
+
+# Part II — Online FR3 integration
+
+## What “online” means
+
+Online control uses the latest robot measurement in every feedback cycle:
+
+```text
+MoveIt reference trajectory
+          |
+          v
+Future reference sampler
+          |
+          v
+NMPC solver <---------- measured q and dq
+          |
+          v
+Torque and torque-rate safety filter
+          |
+          v
+FR3 effort interface
+          |
+          +------------> new measured q and dq
+```
+
+At each update:
+
+1. read measured joint position and velocity;
+2. sample the future reference across the prediction horizon;
+3. solve the NMPC problem;
+4. apply only the first safe torque command;
+5. repeat using the new measured state.
+
+## Current online capability: read-only dry run
+
+The current C++ node can:
+
+- subscribe to `/joint_states`;
+- receive `trajectory_msgs/msg/JointTrajectory`;
+- validate joint names, dimensions, timestamps, and finite values;
+- interpolate position and velocity references;
+- publish the sampled reference;
+- calculate joint-position tracking error.
+
+It cannot move the FR3.
+
+### Build the ROS 2 package
+
+```bash
+source /opt/ros/jazzy/setup.bash
+
 mkdir -p ~/fr3_nmpc_ws/src
 cd ~/fr3_nmpc_ws/src
 git clone https://github.com/ytang19-glitch/fr3_nmpc_controller.git
 
-source /opt/ros/jazzy/setup.bash
-source /opt/franka_ros2_ws/install/setup.bash
-
 cd ~/fr3_nmpc_ws
 rosdep install --from-paths src --ignore-src -r -y
-colcon build --symlink-install
-source install/setup.bash
+colcon build --packages-select fr3_nmpc_controller --symlink-install
+source ~/fr3_nmpc_ws/install/setup.bash
 ```
 
-## 1. Start the dry-run reference monitor
+If the repository is already cloned:
 
 ```bash
+cd ~/fr3_nmpc_ws/src/fr3_nmpc_controller
+git pull origin main
+
+cd ~/fr3_nmpc_ws
+colcon build --packages-select fr3_nmpc_controller --symlink-install
+source ~/fr3_nmpc_ws/install/setup.bash
+```
+
+Do not source `/opt/franka_ros2_ws/install/setup.bash` unless that exact file exists on the computer. When Franka-specific packages are added later, first locate and source the actual Franka workspace installed on the system.
+
+### Start the reference monitor
+
+Terminal 1:
+
+```bash
+source /opt/ros/jazzy/setup.bash
+source ~/fr3_nmpc_ws/install/setup.bash
 ros2 launch fr3_nmpc_controller reference_monitor.launch.py
 ```
 
-By default it reads:
+The node uses:
 
-- measured state: `/joint_states`
-- reference trajectory: `/nmpc/reference_trajectory`
-- sampled reference: `/nmpc/reference_state`
-- tracking error: `/nmpc/tracking_error`
+| Topic | Purpose |
+|---|---|
+| `/joint_states` | Measured FR3 joint state |
+| `/nmpc/reference_trajectory` | Incoming reference trajectory |
+| `/nmpc/reference_state` | Interpolated reference |
+| `/nmpc/tracking_error` | Reference position minus measured position |
 
-It never publishes effort commands.
+### Publish a minimum-jerk reference for monitoring
 
-## 2. Publish a conservative minimum-jerk reference
-
-Keep the robot controller in its normal safe mode. The script reads the current joint state, adds a small displacement to one selected joint, and publishes a smooth reference for monitoring only.
+Terminal 2:
 
 ```bash
+source /opt/ros/jazzy/setup.bash
+source ~/fr3_nmpc_ws/install/setup.bash
+
 ros2 run fr3_nmpc_controller publish_minimum_jerk_reference.py --ros-args \
   -p joint_index:=0 \
   -p displacement:=0.02 \
   -p duration:=8.0
 ```
 
-The default displacement is `0.02 rad`. Publishing this message does not move the robot.
+The publisher waits for a complete `/joint_states` message and builds the reference from the current measured posture. It does not send a robot command.
 
-Inspect the sampled reference and tracking error:
+## MoveIt reference integration
 
-```bash
-ros2 topic echo /nmpc/reference_state
-ros2 topic echo /nmpc/tracking_error
+For the research experiment, MoveIt should generate a collision-free, time-parameterized joint trajectory:
+
+```math
+q_{ref}(t),\quad \dot q_{ref}(t),\quad \ddot q_{ref}(t).
 ```
 
-## 3. Feed a MoveIt trajectory
-
-Plan with MoveIt, but do not call `execute()` when testing this monitor. Publish the planned joint trajectory instead:
+During dry-run validation, plan the trajectory but do not execute it through the standard trajectory controller. Publish it to the reference topic:
 
 ```cpp
 const auto & trajectory = plan.trajectory.joint_trajectory;
 reference_publisher->publish(trajectory);
 ```
 
-The trajectory should contain all seven FR3 joints, strictly increasing `time_from_start`, positions, and velocities at every point. Apply MoveIt time parameterization and jerk smoothing before publishing it.
+Apply time parameterization and jerk smoothing before using the trajectory as an NMPC reference.
 
-## 4. Run the offline NMPC demonstration
+## What must be implemented before online torque control
 
-Install Python dependencies in an isolated environment:
+The following components are mandatory before commanding the real robot:
 
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install casadi numpy
-python3 scripts/offline_nmpc_demo.py
-```
+1. verified FR3 mass, Coriolis, gravity, and payload model;
+2. C++ solver with bounded worst-case execution time;
+3. non-blocking separation between optimization and the 1 kHz hardware loop;
+4. joint-position and velocity safety margins;
+5. torque saturation and torque-rate saturation;
+6. finite-value and stale-state checks;
+7. stale-solution watchdog;
+8. gravity-aware impedance fallback controller;
+9. safe controller activation, switching, and deactivation;
+10. controlled tests for solver timeout and infeasibility.
 
-The demonstration solves a receding-horizon problem with:
+The first hardware experiment must be posture holding at the measured activation pose. Progress afterward to one small, slow joint movement and only then to multi-joint MoveIt references.
 
-- state: joint position and velocity;
-- input: joint acceleration;
-- position, velocity, and acceleration bounds;
-- position/velocity tracking cost;
-- input and input-rate regularization.
+See [docs/REAL_ROBOT_TEST_PLAN.md](docs/REAL_ROBOT_TEST_PLAN.md) for the staged acceptance gates.
 
-This simplified model is for controller development only. A real torque NMPC must use FR3 rigid-body dynamics:
+# Research comparison
 
-```math
-M(q)\ddot q + C(q,\dot q)\dot q + g(q) = \tau.
-```
+Use the same time-parameterized MoveIt trajectory for:
 
-## Development stages
+1. the standard joint-trajectory controller;
+2. joint impedance or computed-torque control;
+3. closed-loop NMPC.
 
-1. Validate reference generation and interpolation with this dry-run monitor.
-2. Validate the NMPC formulation offline and in simulation.
-3. Add an FR3 dynamics backend and compare predicted motion against recorded robot data.
-4. Add a C++ real-time solver, watchdog, torque and torque-rate limits, and impedance fallback.
-5. Test posture hold, then one small joint motion, then slow multi-joint references.
-6. Only then test time-parameterized MoveIt trajectories and gradually increase speed.
+Measure:
 
-See [docs/REAL_ROBOT_TEST_PLAN.md](docs/REAL_ROBOT_TEST_PLAN.md) for acceptance gates and measurements.
+- RMS and maximum joint error;
+- Cartesian tracking error;
+- peak torque and torque rate;
+- mean, maximum, and 99th-percentile solution time;
+- missed deadlines and solver failures;
+- constraint violations;
+- cycle time;
+- grasp success and object slip/drop.
 
-## Research comparison
+This comparison answers the research question:
 
-Use the same time-parameterized MoveIt reference for every controller:
+> As the reference trajectory becomes faster and more dynamically demanding, can closed-loop NMPC maintain tracking accuracy and constraint satisfaction better than conventional control?
 
-- standard joint trajectory controller;
-- joint impedance or computed-torque controller;
-- closed-loop NMPC.
-
-Record tracking error, Cartesian error, torque, torque rate, solver time, deadline misses, constraint violations, cycle time, and task success rate.
-
-## License
+# License
 
 MIT
-
-
-
-## Test
-Create the Python environment
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install casadi numpy
-```
