@@ -1,0 +1,13 @@
+fr3_nmpc_reference_monitor:
+  ros__parameters:
+    joint_names:
+      - fr3_joint1
+      - fr3_joint2
+      - fr3_joint3
+      - fr3_joint4
+      - fr3_joint5
+      - fr3_joint6
+      - fr3_joint7
+    state_topic: /joint_states
+    reference_topic: /nmpc/reference_trajectory
+    sample_rate_hz: 100.0
